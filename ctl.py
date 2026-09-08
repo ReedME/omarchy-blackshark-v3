@@ -32,6 +32,7 @@ PLUGIN_DIR = Path(__file__).resolve().parent
 STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "blackshark"
 STATE_PATH = STATE_DIR / "state.json"
 LOCK_PATH = STATE_DIR / "ctl.lock"
+DEBUG_LOG = STATE_DIR / "hid.log"
 UDEV_RULE = PLUGIN_DIR / "99-razer-blackshark-v3.rules"
 
 EQ_FREQS = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
@@ -88,6 +89,42 @@ CLS_EQ_APPLY = 0xE0
 CLS_EQ_BEGIN = 0xE1
 CLS_PROMPTS_SET = 0xE5
 CLS_LED_SET = 0xE6
+
+CLASS_NAMES = {
+    0x00: "serial",
+    0x02: "init",
+    0x15: "eq-bands",
+    0x16: "mic-eq",
+    0x17: "mic-bands",
+    0x19: "sidetone",
+    0x20: "rf-link",
+    0x21: "battery",
+    0x2A: "charge",
+    0x2C: "power",
+    0x55: "mic-mute",
+    0x5D: "incall",
+    0x5F: "ull",
+    0x60: "eq-meta",
+    0x65: "mix",
+    0x66: "prompts",
+    0x6A: "fn",
+    0x95: "eq-set",
+    0x96: "mic-eq-set",
+    0x97: "mic-eq-data",
+    0x98: "sidetone-on",
+    0x99: "sidetone-set",
+    0x9E: "thx",
+    0xAC: "power-set",
+    0xDC: "mix-set",
+    0xDD: "incall-set",
+    0xDF: "ull-set",
+    0xE0: "eq-apply",
+    0xE1: "eq-gate",
+    0xE5: "prompts-set",
+    0xE6: "led",
+    0xEA: "fn-set",
+    0xEB: "eq-commit",
+}
 CLS_FN_SET = 0xEA
 CLS_EQ_COMMIT = 0xEB
 
@@ -313,25 +350,26 @@ class Headset:
         except OSError:
             return None
 
-    def send(self, buf: bytearray) -> bool:
+    def send(self, buf: bytearray) -> str | None:
+        # Output SET_REPORT (HIDIOCSOUTPUT) is what the device actually
+        # executes. hidraw write() can return 64 without a SET_REPORT URB
+        # when there is no interrupt-OUT endpoint, so it must not go first.
         self.open()
         payload = bytes(buf)
-        wrote = False
+        copy = bytearray(payload)
+        if self._ioctl(HIDIOCSOUTPUT(REPORT_LEN), copy) is not None:
+            time.sleep(0.003)
+            return "output"
+        copy = bytearray(payload)
+        if self._ioctl(HIDIOCSFEATURE(REPORT_LEN), copy) is not None:
+            time.sleep(0.003)
+            return "feature"
         try:
             n = os.write(self.fd, payload)  # type: ignore[arg-type]
-            wrote = n == REPORT_LEN
+            time.sleep(0.003)
+            return "write" if n == REPORT_LEN else None
         except OSError:
-            wrote = False
-        if not wrote:
-            copy = bytearray(payload)
-            if self._ioctl(HIDIOCSOUTPUT(REPORT_LEN), copy) is not None:
-                wrote = True
-        if not wrote:
-            copy = bytearray(payload)
-            if self._ioctl(HIDIOCSFEATURE(REPORT_LEN), copy) is not None:
-                wrote = True
-        time.sleep(0.003)
-        return wrote
+            return None
 
     @staticmethod
     def is_envelope(data: bytes | None) -> bool:
@@ -515,7 +553,6 @@ def cmd_set(kind: str, value) -> dict:
     error = ""
     try:
         hs.open()
-        hs.handshake()
         packets: list[bytearray] = []
 
         if kind == "eq":
@@ -535,8 +572,15 @@ def cmd_set(kind: str, value) -> dict:
             state["eqPreset"] = preset
             state["eqBands"] = bands
         elif kind == "sidetone":
+            # V3 captures (OpenRazer razer_attr_write_sidetone): 0x98 argc=1
+            # arg=0x01, then 0x99 argc=1 arg=level. Early V3 Pro notes used
+            # [0x01, 0x01] on 0x98; that extra byte is a no-op on this dongle.
             level = max(0, min(15, int(value)))
-            packets = [build_set_val(CLS_SIDETONE_INIT, 0x01), build_set_val(CLS_SIDETONE_SET, level)]
+            packets = [
+                build_set_val(CLS_SIDETONE_INIT, 0x01),
+                build_set_val(CLS_SIDETONE_SET, level),
+                build_get(CLS_SIDETONE_GET),
+            ]
             state["sidetone"] = level
         elif kind == "thx":
             on = 1 if bool(value) else 0
@@ -595,17 +639,39 @@ def cmd_set(kind: str, value) -> dict:
         else:
             raise ValueError(f"unknown set kind {kind}")
 
+        debug_events = []
         for pkt in packets:
-            if not hs.send(pkt):
+            via = hs.send(pkt)
+            if not via:
                 error = f"HID write failed for {kind}"
+                debug_events.append({"type": "hid", "dir": "out", "name": "send-fail", "cls": pkt[10], "args": [], "hex": bytes(pkt)[:24].hex()})
                 break
-            hs.drain(0.05)
+            ev = packet_event(pkt, "out")
+            ev["via"] = via
+            debug_events.append(ev)
+            emit_debug(ev)
+            ack = hs.recv_cls(pkt[10], 0.4)
+            if ack:
+                aev = packet_event(ack, "in")
+                debug_events.append(aev)
+                emit_debug(aev)
+                if pkt[10] == CLS_SIDETONE_GET:
+                    args = hs.parse_reply(ack, CLS_SIDETONE_GET)
+                    if args and 0 <= args[0] <= 15:
+                        state["sidetone"] = args[0]
+            else:
+                miss = {"type": "hid", "dir": "in", "name": "no-ack", "cls": pkt[10], "args": [], "hex": ""}
+                debug_events.append(miss)
+                emit_debug(miss)
         save_state(state)
     except Exception as exc:
         error = str(exc)
+        debug_events = []
     finally:
         hs.close()
-    return snapshot(hs, state, {"any": not error, kind: not error}, error)
+    snap = snapshot(hs, state, {"any": not error, kind: not error}, error)
+    snap["debug"] = debug_events
+    return snap
 
 
 def cmd_install_udev() -> dict:
@@ -620,6 +686,43 @@ def cmd_install_udev() -> dict:
     }
 
 
+def emit_debug(ev: dict) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(DEBUG_LOG, "a") as handle:
+            handle.write(json.dumps(ev) + "\n")
+    except OSError:
+        pass
+
+
+def packet_event(data: bytes, direction: str) -> dict:
+    if not data:
+        return {"type": "hid", "dir": direction, "name": "empty", "hex": ""}
+    envelope = Headset.is_envelope(data)
+    cls = data[10] if len(data) > 10 else None
+    name = CLASS_NAMES.get(cls, f"{cls:02x}") if cls is not None and envelope else "raw"
+    argc = data[12] if envelope and len(data) > 12 else 0
+    args = list(data[13 : 13 + max(0, min(8, argc or 0))]) if envelope and len(data) > 13 else []
+    sub = data[11] if envelope and len(data) > 11 else None
+    kind = None
+    if direction == "in" and sub == 0x01:
+        kind = "ack"
+    elif direction == "in" and sub == 0x02:
+        kind = "push"
+    return {
+        "type": "hid",
+        "dir": direction,
+        "report": data[0],
+        "cls": cls,
+        "name": name,
+        "sub": sub,
+        "kind": kind,
+        "argc": argc,
+        "args": args,
+        "hex": data[: min(24, len(data))].hex(),
+    }
+
+
 def apply_push(state: dict, data: bytes) -> bool:
     if not Headset.is_envelope(data):
         return False
@@ -629,7 +732,7 @@ def apply_push(state: dict, data: bytes) -> bool:
         return False
     val = args[0]
     changed = False
-    if cls == CLS_MIX_GET and 0 <= val <= 20:
+    if cls in (CLS_MIX_GET, CLS_MIX_SET) and 0 <= val <= 20:
         state["mix"] = val
         changed = True
     elif cls == CLS_BATTERY and 0 <= val <= 100:
@@ -639,7 +742,7 @@ def apply_push(state: dict, data: bytes) -> bool:
     elif cls == CLS_CHARGE and val in (0, 1):
         state["charging"] = bool(val)
         changed = True
-    elif cls == CLS_SIDETONE_GET and 0 <= val <= 15:
+    elif cls in (CLS_SIDETONE_GET, CLS_SIDETONE_SET) and 0 <= val <= 15:
         state["sidetone"] = val
         changed = True
     elif cls == CLS_MIC_MUTE and val in (0, 1):
@@ -654,7 +757,7 @@ def apply_push(state: dict, data: bytes) -> bool:
     return changed
 
 
-def cmd_monitor(poll_mix: bool) -> int:
+def cmd_monitor(poll_mix: bool, debug: bool) -> int:
     hs = Headset()
     state = load_state()
     if not hs.connected or not hs.permitted:
@@ -662,6 +765,14 @@ def cmd_monitor(poll_mix: bool) -> int:
         return 1
     hs.open()
     hs.handshake()
+    if debug:
+        try:
+            DEBUG_LOG.write_text("")
+        except OSError:
+            pass
+        boot = {"type": "hid", "dir": "out", "name": "monitor", "args": [], "hex": "", "via": "start"}
+        print(json.dumps(boot), flush=True)
+        emit_debug(boot)
     print(json.dumps(snapshot(hs, state, {"any": True})), flush=True)
     last_mix_poll = 0.0
     last_batt_poll = float(state.get("batteryTs") or 0)
@@ -676,25 +787,47 @@ def cmd_monitor(poll_mix: bool) -> int:
                     data = os.read(hs.fd, 128)
                 except OSError:
                     data = None
-                if data and apply_push(state, data):
-                    changed = True
+                if data:
+                    pushed = apply_push(state, data)
+                    if pushed:
+                        changed = True
+                    if debug:
+                        ev = packet_event(data, "in")
+                        # Mix GET replies fire ~2/s from --poll-mix; skip
+                        # unchanged ones so the feed stays readable.
+                        if not (ev.get("cls") == CLS_MIX_GET and not pushed):
+                            print(json.dumps(ev), flush=True)
+                            emit_debug(ev)
             if poll_mix and now - last_mix_poll >= 0.45:
                 last_mix_poll = now
-                reply = hs.get(CLS_MIX_GET)
-                args = hs.parse_reply(reply, CLS_MIX_GET)
+                with open(LOCK_PATH, "a+") as handle:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        reply = None
+                    else:
+                        reply = hs.get(CLS_MIX_GET)
+                args = hs.parse_reply(reply, CLS_MIX_GET) if reply else None
                 if args and 0 <= args[0] <= 20 and args[0] != state.get("mix"):
                     state["mix"] = args[0]
                     changed = True
             if now - last_batt_poll >= 300:
                 last_batt_poll = now
-                reply = hs.get(CLS_BATTERY)
-                args = hs.parse_reply(reply, CLS_BATTERY)
+                with open(LOCK_PATH, "a+") as handle:
+                    try:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        reply = None
+                        charge = None
+                    else:
+                        reply = hs.get(CLS_BATTERY)
+                        charge = hs.get(CLS_CHARGE)
+                args = hs.parse_reply(reply, CLS_BATTERY) if reply else None
                 if args and 0 <= args[0] <= 100:
                     state["battery"] = args[0]
                     state["batteryTs"] = now
                     changed = True
-                charge = hs.get(CLS_CHARGE)
-                cargs = hs.parse_reply(charge, CLS_CHARGE)
+                cargs = hs.parse_reply(charge, CLS_CHARGE) if charge else None
                 if cargs and cargs[0] in (0, 1):
                     state["charging"] = bool(cargs[0])
                     changed = True
@@ -727,6 +860,7 @@ def main() -> int:
     sub.add_parser("find")
     mon = sub.add_parser("monitor")
     mon.add_argument("--poll-mix", action="store_true")
+    mon.add_argument("--debug", action="store_true")
 
     args = parser.parse_args()
     if args.cmd == "status":
@@ -740,7 +874,7 @@ def main() -> int:
         print(json.dumps(cmd_install_udev()))
         return 0
     if args.cmd == "monitor":
-        return cmd_monitor(args.poll_mix)
+        return cmd_monitor(args.poll_mix, args.debug)
     if args.cmd == "set":
         kind = args.kind
         values = args.values

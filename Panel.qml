@@ -91,11 +91,16 @@ Panel {
     property var battery: null
     property var charging: null
     property var micMuted: null
+    property bool debug: false
+    property var debugLines: []
   }
 
   property var pendingSet: null
   property bool wantBattery: false
   property real lastBatteryPoll: 0
+  property bool monitorWanted: true
+
+  readonly property bool batteryLow: hid.battery !== null && hid.battery !== undefined && hid.battery >= 0 && hid.battery < 10
 
   readonly property string batteryText: {
     if (hid.battery === null || hid.battery === undefined || hid.battery < 0)
@@ -144,8 +149,31 @@ Panel {
     if (value > 0) node.audio.muted = false
   }
 
+  function appendDebug(ev) {
+    if (!ev) return
+    var dir = ev.dir === "out" ? "→" : "←"
+    var name = ev.name || "?"
+    var args = (ev.args && ev.args.length) ? " [" + ev.args.join(" ") + "]" : ""
+    var extra = ""
+    if (ev.kind) extra += " " + ev.kind
+    if (ev.via) extra += " " + ev.via
+    var line = dir + " " + name + args + extra
+    if (ev.hex) line += "  " + ev.hex
+    var lines = hid.debugLines.slice()
+    lines.push(line)
+    if (lines.length > 8) lines = lines.slice(lines.length - 8)
+    hid.debugLines = lines
+  }
+
   function applyHid(raw) {
     var parsed = Model.parseHid(raw)
+    if (parsed.type === "hid") {
+      root.appendDebug(parsed)
+      return
+    }
+    if (parsed.debug && parsed.debug.length) {
+      for (var i = 0; i < parsed.debug.length; i++) root.appendDebug(parsed.debug[i])
+    }
     if (!parsed.ok && parsed.error) {
       hid.error = parsed.error
       return
@@ -204,6 +232,15 @@ Panel {
     if (udevProc.running) return
     udevProc.command = ["pkexec", root.udevPath, root.rulePath]
     udevProc.running = true
+  }
+
+  function toggleDebug() {
+    hid.debug = !hid.debug
+    hid.debugLines = hid.debug
+      ? ["HID debug on — click Sidetone or use headset buttons"]
+      : []
+    root.monitorWanted = false
+    Qt.callLater(function() { root.monitorWanted = true })
   }
 
   onOpenedChanged: {
@@ -271,8 +308,10 @@ Panel {
 
   Process {
     id: monitorProc
-    running: hid.permission
-    command: ["python3", "-u", "-B", root.helperPath, "monitor", "--poll-mix"]
+    running: hid.permission && root.monitorWanted
+    command: hid.debug
+      ? ["python3", "-u", "-B", root.helperPath, "monitor", "--poll-mix", "--debug"]
+      : ["python3", "-u", "-B", root.helperPath, "monitor", "--poll-mix"]
     stdout: SplitParser {
       onRead: function(line) { root.applyHid(line) }
     }
@@ -285,7 +324,7 @@ Panel {
     text: root.barLabel
     fontSize: Style.bar.iconFont
     tooltipText: root.tooltip
-    active: root.opened || root.connected
+    active: root.batteryLow
     onPressed: function(b) { root.toggle() }
   }
 
@@ -324,12 +363,26 @@ Panel {
           id: meta
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
-          color: root.dim
+          color: hid.debug ? root.accent : root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           font.bold: true
-          text: root.batteryText
+          text: root.batteryText + (hid.debug ? "  HID" : "  debug")
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.toggleDebug()
+          }
         }
+      }
+
+      Button {
+        width: parent.width
+        text: hid.debug ? "HID debug on" : "Show HID debug"
+        selected: hid.debug
+        foreground: root.foreground
+        accent: root.accent
+        onClicked: root.toggleDebug()
       }
 
       Text {
@@ -349,6 +402,17 @@ Panel {
         foreground: root.foreground
         accent: root.accent
         onClicked: root.grantHid()
+      }
+
+      Text {
+        width: parent.width
+        visible: hid.debug
+        wrapMode: Text.WrapAnywhere
+        text: hid.debugLines.length ? hid.debugLines.join("\n") : "waiting for HID…"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        maximumLineCount: 8
       }
 
       Item {
@@ -428,6 +492,14 @@ Panel {
               hid.sidetone = Math.round(v)
               root.runSet("sidetone", [hid.sidetone])
             }
+          }
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Mic monitoring in the cups — unmute the boom mic and speak. This is not Game/Chat mix."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
           SliderRow {

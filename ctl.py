@@ -548,7 +548,10 @@ def cmd_set(kind: str, value) -> dict:
             state["ull"] = bool(on)
         elif kind == "mix":
             bal = max(0, min(20, int(value)))
-            packets = [build_cmd(CLS_MIX_SET, [bal, 0x00], argc=0x01)]
+            packets = [
+                build_cmd(CLS_MIX_SET, [bal, 0x00], argc=0x01),
+                build_cmd(0xE5, [bal], sub=0x01, argc=0x01),
+            ]
             state["mix"] = bal
         elif kind == "mic-eq":
             idx = max(0, min(3, int(value)))
@@ -596,9 +599,9 @@ def cmd_set(kind: str, value) -> dict:
             if not hs.send(pkt):
                 error = f"HID write failed for {kind}"
                 break
-            hs.recv(0.05)
+            hs.drain(0.05)
         save_state(state)
-    except (OSError, ValueError) as exc:
+    except Exception as exc:
         error = str(exc)
     finally:
         hs.close()
@@ -615,6 +618,94 @@ def cmd_install_udev() -> dict:
             str(UDEV_RULE),
         ],
     }
+
+
+def apply_push(state: dict, data: bytes) -> bool:
+    if not Headset.is_envelope(data):
+        return False
+    cls = data[10]
+    args = list(data[13 : 13 + max(1, min(16, data[12] or 1))])
+    if not args:
+        return False
+    val = args[0]
+    changed = False
+    if cls == CLS_MIX_GET and 0 <= val <= 20:
+        state["mix"] = val
+        changed = True
+    elif cls == CLS_BATTERY and 0 <= val <= 100:
+        state["battery"] = val
+        state["batteryTs"] = time.time()
+        changed = True
+    elif cls == CLS_CHARGE and val in (0, 1):
+        state["charging"] = bool(val)
+        changed = True
+    elif cls == CLS_SIDETONE_GET and 0 <= val <= 15:
+        state["sidetone"] = val
+        changed = True
+    elif cls == CLS_MIC_MUTE and val in (0, 1):
+        state["micMuted"] = bool(val)
+        changed = True
+    elif cls == CLS_THX and val in (0, 1):
+        state["thx"] = bool(val)
+        changed = True
+    elif cls == CLS_ULL_GET and val in (0, 1):
+        state["ull"] = bool(val)
+        changed = True
+    return changed
+
+
+def cmd_monitor(poll_mix: bool) -> int:
+    hs = Headset()
+    state = load_state()
+    if not hs.connected or not hs.permitted:
+        print(json.dumps(snapshot(hs, state, {}, "Headset not connected" if not hs.connected else "Need hidraw access")), flush=True)
+        return 1
+    hs.open()
+    hs.handshake()
+    print(json.dumps(snapshot(hs, state, {"any": True})), flush=True)
+    last_mix_poll = 0.0
+    last_batt_poll = float(state.get("batteryTs") or 0)
+    try:
+        while True:
+            timeout = 0.4 if poll_mix else 1.0
+            r, _, _ = select.select([hs.fd], [], [], timeout)
+            now = time.time()
+            changed = False
+            if r:
+                try:
+                    data = os.read(hs.fd, 128)
+                except OSError:
+                    data = None
+                if data and apply_push(state, data):
+                    changed = True
+            if poll_mix and now - last_mix_poll >= 0.45:
+                last_mix_poll = now
+                reply = hs.get(CLS_MIX_GET)
+                args = hs.parse_reply(reply, CLS_MIX_GET)
+                if args and 0 <= args[0] <= 20 and args[0] != state.get("mix"):
+                    state["mix"] = args[0]
+                    changed = True
+            if now - last_batt_poll >= 300:
+                last_batt_poll = now
+                reply = hs.get(CLS_BATTERY)
+                args = hs.parse_reply(reply, CLS_BATTERY)
+                if args and 0 <= args[0] <= 100:
+                    state["battery"] = args[0]
+                    state["batteryTs"] = now
+                    changed = True
+                charge = hs.get(CLS_CHARGE)
+                cargs = hs.parse_reply(charge, CLS_CHARGE)
+                if cargs and cargs[0] in (0, 1):
+                    state["charging"] = bool(cargs[0])
+                    changed = True
+            if changed:
+                save_state(state)
+                print(json.dumps(snapshot(hs, state, {"any": True})), flush=True)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        hs.close()
+    return 0
 
 
 def parse_bool(value: str) -> bool:
@@ -634,6 +725,8 @@ def main() -> int:
 
     sub.add_parser("install-udev")
     sub.add_parser("find")
+    mon = sub.add_parser("monitor")
+    mon.add_argument("--poll-mix", action="store_true")
 
     args = parser.parse_args()
     if args.cmd == "status":
@@ -646,6 +739,8 @@ def main() -> int:
     if args.cmd == "install-udev":
         print(json.dumps(cmd_install_udev()))
         return 0
+    if args.cmd == "monitor":
+        return cmd_monitor(args.poll_mix)
     if args.cmd == "set":
         kind = args.kind
         values = args.values

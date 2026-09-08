@@ -269,6 +269,15 @@ Panel {
     }
   }
 
+  Process {
+    id: monitorProc
+    running: hid.permission
+    command: ["python3", "-u", "-B", root.helperPath, "monitor", "--poll-mix"]
+    stdout: SplitParser {
+      onRead: function(line) { root.applyHid(line) }
+    }
+  }
+
   WidgetButton {
     id: button
     anchors.fill: parent

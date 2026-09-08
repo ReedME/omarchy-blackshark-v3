@@ -16,9 +16,11 @@ sys.dont_write_bytecode = True
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import select
+import subprocess
 import time
 from pathlib import Path
 
@@ -34,7 +36,13 @@ STATE_PATH = STATE_DIR / "state.json"
 LOCK_PATH = STATE_DIR / "ctl.lock"
 DEBUG_LOG = STATE_DIR / "hid.log"
 DEBUG_FLAG = STATE_DIR / "debug"
-UDEV_RULE = PLUGIN_DIR / "99-razer-blackshark-v3.rules"
+UDEV_RULE_DEST = "/etc/udev/rules.d/99-razer-blackshark-v3.rules"
+UDEV_RULE_TEXT = (
+    "# Razer BlackShark V3 (1532:057A) vendor HID — bar widget + ctl.py\n"
+    'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", '
+    'ATTRS{idProduct}=="057a", MODE="0660", TAG+="uaccess"\n'
+)
+UDEV_RULE_SHA256 = "505149ab75c6419a7c3edca5f65d4631830e94f310f613d28588fa179060f3af"
 
 EQ_FREQS = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
 EQ_PRESETS = ["Default", "Game", "Movie", "Music", "Esports"]
@@ -682,16 +690,57 @@ def cmd_set(kind: str, value) -> dict:
     return snap
 
 
+def privileged_udev_script() -> str:
+    digest = hashlib.sha256(UDEV_RULE_TEXT.encode("utf-8")).hexdigest()
+    if digest != UDEV_RULE_SHA256:
+        raise RuntimeError("embedded udev rule checksum mismatch")
+    # pkexec runs /bin/sh (distro-owned). The rule is a quoted heredoc in this
+    # constant script — no path from the user-writable plugin directory.
+    return f"""set -eu
+DEST={UDEV_RULE_DEST}
+if [ -L "$DEST" ]; then
+  echo "refusing symlink $DEST" >&2
+  exit 1
+fi
+TMP=$(/usr/bin/mktemp "$DEST.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+if [ -L "$TMP" ]; then
+  echo "refusing symlink $TMP" >&2
+  exit 1
+fi
+umask 022
+cat > "$TMP" <<'END_UDEV_RULE'
+{UDEV_RULE_TEXT}END_UDEV_RULE
+printf '%s  %s\\n' '{UDEV_RULE_SHA256}' "$TMP" | /usr/bin/sha256sum -c -
+if [ -L "$DEST" ]; then
+  echo "refusing symlink $DEST" >&2
+  exit 1
+fi
+/usr/bin/mv -f "$TMP" "$DEST"
+trap - EXIT
+if [ -L "$DEST" ] || [ ! -f "$DEST" ]; then
+  echo "install produced a non-regular file" >&2
+  exit 1
+fi
+/usr/bin/udevadm control --reload-rules
+/usr/bin/udevadm trigger --subsystem-match=hidraw --action=add
+"""
+
+
 def cmd_install_udev() -> dict:
-    return {
-        "ok": True,
-        "rule": str(UDEV_RULE),
-        "command": [
-            "pkexec",
-            str(PLUGIN_DIR / "install-udev.sh"),
-            str(UDEV_RULE),
-        ],
-    }
+    try:
+        script = privileged_udev_script()
+    except RuntimeError as exc:
+        return {"ok": False, "error": str(exc)}
+    proc = subprocess.run(
+        ["pkexec", "/bin/sh", "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip() or "Could not grant HID access"
+        return {"ok": False, "error": err}
+    return {"ok": True}
 
 
 def debug_allowed() -> bool:
@@ -896,8 +945,9 @@ def main() -> int:
         print(json.dumps({"hidraw": str(path) if path else None, "access": bool(path and os.access(path, os.R_OK | os.W_OK))}))
         return 0
     if args.cmd == "install-udev":
-        print(json.dumps(cmd_install_udev()))
-        return 0
+        result = cmd_install_udev()
+        print(json.dumps(result))
+        return 0 if result.get("ok") else 1
     if args.cmd == "debug":
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         if args.mode == "on":

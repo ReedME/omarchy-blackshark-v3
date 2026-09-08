@@ -20,8 +20,6 @@ Panel {
   readonly property string fontFamily: (bar && bar.fontFamily) ? bar.fontFamily : "sans-serif"
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
   readonly property string helperPath: String(Qt.resolvedUrl("ctl.py")).replace(/^file:\/\//, "")
-  readonly property string udevPath: String(Qt.resolvedUrl("install-udev.sh")).replace(/^file:\/\//, "")
-  readonly property string rulePath: String(Qt.resolvedUrl("99-razer-blackshark-v3.rules")).replace(/^file:\/\//, "")
 
   readonly property var gameSink: {
     for (var i = 0; i < nodes.length; i++)
@@ -242,7 +240,7 @@ Panel {
 
   function grantHid() {
     if (udevProc.running) return
-    udevProc.command = ["pkexec", root.udevPath, root.rulePath]
+    udevProc.command = ["python3", "-B", root.helperPath, "install-udev"]
     udevProc.running = true
   }
 
@@ -310,10 +308,11 @@ Panel {
     id: udevProc
     running: false
     command: []
-    stdout: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector { id: udevOut; waitForEnd: true }
     stderr: StdioCollector { id: udevErr; waitForEnd: true }
     onExited: function(code) {
-      if (code !== 0) hid.error = String(udevErr.text || "Could not grant HID access")
+      var parsed = Model.parseHid(udevOut.text)
+      if (code !== 0) hid.error = parsed.error || String(udevErr.text || "Could not grant HID access")
       else hid.error = ""
       root.refreshHid()
     }

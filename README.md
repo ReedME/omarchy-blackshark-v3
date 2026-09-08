@@ -37,7 +37,7 @@ HID writes go to the dongle. Battery is polled at most every five minutes so the
 
 ### HID access (optional)
 
-The first time you want live HID control, open the panel and click **Grant HID access**. That installs a udev rule for the vendor hidraw node (`1532:057A`) via polkit. It does not change Omarchy or PipeWire config.
+The first time you want live HID control, open the panel and click **Grant HID access** (or run `python3 ctl.py install-udev`). Polkit runs distro `/bin/sh` and `/usr/bin/udevadm` only — not a helper from this plugin directory — and writes a checksummed, embedded udev rule for `1532:057A` (`MODE=0660`, `TAG+=uaccess`). The device is never made world-writable. It does not change Omarchy or PipeWire config.
 
 ## Remove
 

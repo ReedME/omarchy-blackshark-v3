@@ -92,6 +92,7 @@ Panel {
     property var charging: null
     property var micMuted: null
     property bool debug: false
+    property bool debugAllowed: false
     property var debugLines: []
   }
 
@@ -150,7 +151,7 @@ Panel {
   }
 
   function appendDebug(ev) {
-    if (!ev) return
+    if (!ev || !hid.debugAllowed || !hid.debug) return
     var dir = ev.dir === "out" ? "→" : "←"
     var name = ev.name || "?"
     var args = (ev.args && ev.args.length) ? " [" + ev.args.join(" ") + "]" : ""
@@ -169,6 +170,10 @@ Panel {
     var parsed = Model.parseHid(raw)
     if (parsed.type === "hid") {
       root.appendDebug(parsed)
+      var cls = Number(parsed.cls)
+      var v = (parsed.args && parsed.args.length) ? Number(parsed.args[0]) : NaN
+      if ((cls === 0x5c || cls === 0x65) && v >= 0 && v <= 20) hid.mix = v
+      if (cls === 0x19 && v >= 0 && v <= 15) hid.sidetone = v
       return
     }
     if (parsed.debug && parsed.debug.length) {
@@ -203,6 +208,13 @@ Panel {
     if (parsed.battery !== undefined) hid.battery = parsed.battery
     if (parsed.charging !== undefined) hid.charging = parsed.charging
     if (parsed.micMuted !== undefined) hid.micMuted = parsed.micMuted
+    if (parsed.debugAllowed !== undefined) {
+      hid.debugAllowed = parsed.debugAllowed === true
+      if (!hid.debugAllowed && hid.debug) {
+        hid.debug = false
+        hid.debugLines = []
+      }
+    }
   }
 
   function refreshHid() {
@@ -235,6 +247,7 @@ Panel {
   }
 
   function toggleDebug() {
+    if (!hid.debugAllowed) return
     hid.debug = !hid.debug
     hid.debugLines = hid.debug
       ? ["HID debug on — click Sidetone or use headset buttons"]
@@ -309,7 +322,7 @@ Panel {
   Process {
     id: monitorProc
     running: hid.permission && root.monitorWanted
-    command: hid.debug
+    command: (hid.debugAllowed && hid.debug)
       ? ["python3", "-u", "-B", root.helperPath, "monitor", "--poll-mix", "--debug"]
       : ["python3", "-u", "-B", root.helperPath, "monitor", "--poll-mix"]
     stdout: SplitParser {
@@ -367,16 +380,18 @@ Panel {
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           font.bold: true
-          text: root.batteryText + (hid.debug ? "  HID" : "  debug")
+          text: root.batteryText + (hid.debugAllowed ? (hid.debug ? "  HID" : "  debug") : "")
           MouseArea {
             anchors.fill: parent
-            cursorShape: Qt.PointingHandCursor
+            enabled: hid.debugAllowed
+            cursorShape: hid.debugAllowed ? Qt.PointingHandCursor : Qt.ArrowCursor
             onClicked: root.toggleDebug()
           }
         }
       }
 
       Button {
+        visible: hid.debugAllowed
         width: parent.width
         text: hid.debug ? "HID debug on" : "Show HID debug"
         selected: hid.debug
@@ -406,7 +421,7 @@ Panel {
 
       Text {
         width: parent.width
-        visible: hid.debug
+        visible: hid.debugAllowed && hid.debug
         wrapMode: Text.WrapAnywhere
         text: hid.debugLines.length ? hid.debugLines.join("\n") : "waiting for HID…"
         color: root.dim

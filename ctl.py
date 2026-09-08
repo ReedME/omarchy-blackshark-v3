@@ -33,6 +33,7 @@ STATE_DIR = Path.home() / ".local" / "state" / "omarchy" / "blackshark"
 STATE_PATH = STATE_DIR / "state.json"
 LOCK_PATH = STATE_DIR / "ctl.lock"
 DEBUG_LOG = STATE_DIR / "hid.log"
+DEBUG_FLAG = STATE_DIR / "debug"
 UDEV_RULE = PLUGIN_DIR / "99-razer-blackshark-v3.rules"
 
 EQ_FREQS = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
@@ -72,6 +73,7 @@ CLS_MIC_MUTE = 0x55
 CLS_INCALL_GET = 0x5D
 CLS_ULL_GET = 0x5F
 CLS_EQ_META_GET = 0x60
+CLS_MIX_PUSH = 0x5C
 CLS_MIX_GET = 0x65
 CLS_PROMPTS_GET = 0x66
 CLS_FN_GET = 0x6A
@@ -102,6 +104,7 @@ CLASS_NAMES = {
     0x2A: "charge",
     0x2C: "power",
     0x55: "mic-mute",
+    0x5C: "mix",
     0x5D: "incall",
     0x5F: "ull",
     0x60: "eq-meta",
@@ -482,6 +485,7 @@ def snapshot(hs: Headset, state: dict, live: dict, error: str = "") -> dict:
         "serial": state.get("serial") or "",
         "error": error or hs.error,
         "needsUdev": hs.connected and not hs.permitted,
+        "debugAllowed": debug_allowed(),
         "factoryEq": {str(k): v for k, v in FACTORY_EQ.items()},
         "liveFields": sorted(k for k, v in live.items() if v and k != "any"),
     }
@@ -591,10 +595,13 @@ def cmd_set(kind: str, value) -> dict:
             packets = [build_set_val(CLS_ULL_SET, on)]
             state["ull"] = bool(on)
         elif kind == "mix":
+            # Synapse/OpenRazer: 0xDC size=6 argc=1 args=[balance, 0].
+            # This dongle reports the analog wheel as unsolicited 0x5C
+            # pushes, so read that back instead of GET 0x65.
             bal = max(0, min(20, int(value)))
             packets = [
                 build_cmd(CLS_MIX_SET, [bal, 0x00], argc=0x01),
-                build_cmd(0xE5, [bal], sub=0x01, argc=0x01),
+                build_get(CLS_MIX_PUSH),
             ]
             state["mix"] = bal
         elif kind == "mic-eq":
@@ -655,10 +662,11 @@ def cmd_set(kind: str, value) -> dict:
                 aev = packet_event(ack, "in")
                 debug_events.append(aev)
                 emit_debug(aev)
-                if pkt[10] == CLS_SIDETONE_GET:
-                    args = hs.parse_reply(ack, CLS_SIDETONE_GET)
-                    if args and 0 <= args[0] <= 15:
-                        state["sidetone"] = args[0]
+                args = hs.parse_reply(ack, pkt[10])
+                if pkt[10] == CLS_SIDETONE_GET and args and 0 <= args[0] <= 15:
+                    state["sidetone"] = args[0]
+                if pkt[10] in (CLS_MIX_PUSH, CLS_MIX_GET) and args and 0 <= args[0] <= 20:
+                    state["mix"] = args[0]
             else:
                 miss = {"type": "hid", "dir": "in", "name": "no-ack", "cls": pkt[10], "args": [], "hex": ""}
                 debug_events.append(miss)
@@ -670,7 +678,7 @@ def cmd_set(kind: str, value) -> dict:
     finally:
         hs.close()
     snap = snapshot(hs, state, {"any": not error, kind: not error}, error)
-    snap["debug"] = debug_events
+    snap["debug"] = debug_events if debug_allowed() else []
     return snap
 
 
@@ -686,7 +694,16 @@ def cmd_install_udev() -> dict:
     }
 
 
+def debug_allowed() -> bool:
+    env = str(os.environ.get("BLACKSHARK_DEBUG") or "").strip().lower()
+    if env in ("1", "true", "on", "yes"):
+        return True
+    return DEBUG_FLAG.is_file()
+
+
 def emit_debug(ev: dict) -> None:
+    if not debug_allowed():
+        return
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         with open(DEBUG_LOG, "a") as handle:
@@ -732,7 +749,10 @@ def apply_push(state: dict, data: bytes) -> bool:
         return False
     val = args[0]
     changed = False
-    if cls in (CLS_MIX_GET, CLS_MIX_SET) and 0 <= val <= 20:
+    # 0x5C = analog Game/Chat wheel (this 057A dongle). 0x65 = V3 GET.
+    # Never treat 0xDC SET ACKs as the mix — those reply args[0]=0 (status),
+    # which was snapping the slider back to Game / the last wheel position.
+    if cls in (CLS_MIX_PUSH, CLS_MIX_GET) and 0 <= val <= 20:
         state["mix"] = val
         changed = True
     elif cls == CLS_BATTERY and 0 <= val <= 100:
@@ -742,7 +762,7 @@ def apply_push(state: dict, data: bytes) -> bool:
     elif cls == CLS_CHARGE and val in (0, 1):
         state["charging"] = bool(val)
         changed = True
-    elif cls in (CLS_SIDETONE_GET, CLS_SIDETONE_SET) and 0 <= val <= 15:
+    elif cls == CLS_SIDETONE_GET and 0 <= val <= 15:
         state["sidetone"] = val
         changed = True
     elif cls == CLS_MIC_MUTE and val in (0, 1):
@@ -795,7 +815,8 @@ def cmd_monitor(poll_mix: bool, debug: bool) -> int:
                         ev = packet_event(data, "in")
                         # Mix GET replies fire ~2/s from --poll-mix; skip
                         # unchanged ones so the feed stays readable.
-                        if not (ev.get("cls") == CLS_MIX_GET and not pushed):
+                        skip_poll = ev.get("cls") in (CLS_MIX_GET, CLS_MIX_PUSH) and ev.get("kind") != "push" and not pushed
+                        if not skip_poll:
                             print(json.dumps(ev), flush=True)
                             emit_debug(ev)
             if poll_mix and now - last_mix_poll >= 0.45:
@@ -806,8 +827,10 @@ def cmd_monitor(poll_mix: bool, debug: bool) -> int:
                     except BlockingIOError:
                         reply = None
                     else:
-                        reply = hs.get(CLS_MIX_GET)
-                args = hs.parse_reply(reply, CLS_MIX_GET) if reply else None
+                        reply = hs.get(CLS_MIX_PUSH) or hs.get(CLS_MIX_GET)
+                args = None
+                if reply:
+                    args = hs.parse_reply(reply, CLS_MIX_PUSH) or hs.parse_reply(reply, CLS_MIX_GET)
                 if args and 0 <= args[0] <= 20 and args[0] != state.get("mix"):
                     state["mix"] = args[0]
                     changed = True
@@ -858,6 +881,8 @@ def main() -> int:
 
     sub.add_parser("install-udev")
     sub.add_parser("find")
+    dbg = sub.add_parser("debug")
+    dbg.add_argument("mode", choices=["on", "off"])
     mon = sub.add_parser("monitor")
     mon.add_argument("--poll-mix", action="store_true")
     mon.add_argument("--debug", action="store_true")
@@ -873,8 +898,19 @@ def main() -> int:
     if args.cmd == "install-udev":
         print(json.dumps(cmd_install_udev()))
         return 0
+    if args.cmd == "debug":
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if args.mode == "on":
+            DEBUG_FLAG.write_text("")
+        else:
+            try:
+                DEBUG_FLAG.unlink()
+            except FileNotFoundError:
+                pass
+        print(json.dumps({"ok": True, "debugAllowed": debug_allowed()}))
+        return 0
     if args.cmd == "monitor":
-        return cmd_monitor(args.poll_mix, args.debug)
+        return cmd_monitor(args.poll_mix, args.debug and debug_allowed())
     if args.cmd == "set":
         kind = args.kind
         values = args.values

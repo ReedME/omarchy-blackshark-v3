@@ -12,6 +12,16 @@ omarchy plugin add https://github.com/ReedME/omarchy-blackshark-v3.git --enable
 
 That clones the plugin, validates the manifest, and places the widget on the right side of the bar (before the audio widget when that slot exists).
 
+HID packet debug is off unless you create the debug flag before (or after) install:
+
+```sh
+mkdir -p ~/.local/state/omarchy/blackshark
+touch ~/.local/state/omarchy/blackshark/debug
+omarchy plugin add https://github.com/ReedME/omarchy-blackshark-v3.git --enable
+```
+
+Or later: `python3 ~/.config/omarchy/plugins/reedme.blackshark/ctl.py debug on` (and `debug off` to hide it again). Reopen the popup after toggling.
+
 Python 3 from the base system is the only runtime dependency. No extra packages.
 
 ## Usage

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "reedme.blackshark",
   "name": "BlackShark V3",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "author": "Brendan Reed",
   "license": "MIT",
   "description": "Razer BlackShark V3 bar widget: battery, EQ, sidetone, mix, THX, and Game/Chat send.",

@@ -36,13 +36,18 @@ STATE_PATH = STATE_DIR / "state.json"
 LOCK_PATH = STATE_DIR / "ctl.lock"
 DEBUG_LOG = STATE_DIR / "hid.log"
 DEBUG_FLAG = STATE_DIR / "debug"
-UDEV_RULE_DEST = "/etc/udev/rules.d/99-razer-blackshark-v3.rules"
+UDEV_RULE_DEST = "/etc/udev/rules.d/70-razer-blackshark-v3.rules"
+UDEV_RULE_OLD = "/etc/udev/rules.d/99-razer-blackshark-v3.rules"
+# Must be named 70-* so TAG+="uaccess" is set before 73-seat-late.rules runs
+# the uaccess builtin. MODE= in a 99-* rule either misses that builtin or
+# clobbers the ACL it just applied (0660 root:root is still not user-writable).
 UDEV_RULE_TEXT = (
     "# Razer BlackShark V3 (1532:057A) vendor HID — bar widget + ctl.py\n"
+    '# Must sort before 73-seat-late.rules so TAG+="uaccess" actually applies.\n'
     'KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", '
-    'ATTRS{idProduct}=="057a", MODE="0660", TAG+="uaccess"\n'
+    'ATTRS{idProduct}=="057a", TAG+="uaccess"\n'
 )
-UDEV_RULE_SHA256 = "505149ab75c6419a7c3edca5f65d4631830e94f310f613d28588fa179060f3af"
+UDEV_RULE_SHA256 = "d19edca7e6b786ae59857e7c09f57523148dc373dc553cc787a4671073173ae0"
 
 EQ_FREQS = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
 EQ_PRESETS = ["Default", "Game", "Movie", "Music", "Esports"]
@@ -698,10 +703,13 @@ def privileged_udev_script() -> str:
     # constant script — no path from the user-writable plugin directory.
     return f"""set -eu
 DEST={UDEV_RULE_DEST}
-if [ -L "$DEST" ]; then
-  echo "refusing symlink $DEST" >&2
-  exit 1
-fi
+OLD={UDEV_RULE_OLD}
+for path in "$DEST" "$OLD"; do
+  if [ -L "$path" ]; then
+    echo "refusing symlink $path" >&2
+    exit 1
+  fi
+done
 TMP=$(/usr/bin/mktemp "$DEST.XXXXXX")
 trap 'rm -f "$TMP"' EXIT
 if [ -L "$TMP" ]; then
@@ -712,18 +720,28 @@ umask 022
 cat > "$TMP" <<'END_UDEV_RULE'
 {UDEV_RULE_TEXT}END_UDEV_RULE
 printf '%s  %s\\n' '{UDEV_RULE_SHA256}' "$TMP" | /usr/bin/sha256sum -c -
+/usr/bin/chmod 644 "$TMP"
 if [ -L "$DEST" ]; then
   echo "refusing symlink $DEST" >&2
   exit 1
 fi
 /usr/bin/mv -f "$TMP" "$DEST"
 trap - EXIT
+if [ -e "$OLD" ]; then
+  if [ -L "$OLD" ]; then
+    echo "refusing symlink $OLD" >&2
+    exit 1
+  fi
+  /usr/bin/rm -f "$OLD"
+fi
 if [ -L "$DEST" ] || [ ! -f "$DEST" ]; then
   echo "install produced a non-regular file" >&2
   exit 1
 fi
 /usr/bin/udevadm control --reload-rules
 /usr/bin/udevadm trigger --subsystem-match=hidraw --action=add
+/usr/bin/udevadm trigger --subsystem-match=hidraw --action=change
+/usr/bin/udevadm settle --timeout=5
 """
 
 

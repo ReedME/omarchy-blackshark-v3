@@ -37,7 +37,7 @@ HID writes go to the dongle. Battery is polled at most every five minutes so the
 
 ### HID access (optional)
 
-The first time you want live HID control, open the panel and click **Grant HID access** (or run `python3 ctl.py install-udev`). Polkit runs distro `/bin/sh` and `/usr/bin/udevadm` only — not a helper from this plugin directory — and writes a checksummed, embedded udev rule for `1532:057A` (`MODE=0660`, `TAG+=uaccess`). The device is never made world-writable. It does not change Omarchy or PipeWire config.
+The first time you want live HID control, open the panel and click **Grant HID access** (or run `python3 ctl.py install-udev`). Polkit runs distro `/bin/sh` and `/usr/bin/udevadm` only — not a helper from this plugin directory — and writes a checksummed, embedded udev rule for `1532:057A` (`TAG+=uaccess`, as `70-razer-blackshark-v3.rules` so systemd's seat-late builtin can apply the ACL). The device is never made world-writable. It does not change Omarchy or PipeWire config.
 
 ## Remove
 
@@ -48,7 +48,7 @@ omarchy plugin remove reedme.blackshark
 To drop the optional udev rule as well:
 
 ```sh
-sudo rm -f /etc/udev/rules.d/99-razer-blackshark-v3.rules
+sudo rm -f /etc/udev/rules.d/70-razer-blackshark-v3.rules /etc/udev/rules.d/99-razer-blackshark-v3.rules
 sudo udevadm control --reload-rules
 ```
 

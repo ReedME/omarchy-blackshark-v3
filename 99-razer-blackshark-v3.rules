@@ -1,2 +1,0 @@
-# Razer BlackShark V3 (1532:057A) vendor HID — bar widget + ctl.py
-KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1532", ATTRS{idProduct}=="057a", MODE="0660", TAG+="uaccess"
